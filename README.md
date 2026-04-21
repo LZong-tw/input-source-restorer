@@ -2,9 +2,9 @@
 
 A tiny macOS LaunchAgent that restores your input source after Touch ID / password prompts silently switch it to ABC.
 
-修復 macOS 一個沒人記錄的 bug：每次 Touch ID 或密碼框觸發 Secure Input，macOS 會悄悄把輸入法切成 ABC，認證結束後**不會切回來**。對鼠鬚管、注音、中文、日文、韓文、俄文等非 ABC 使用者特別惱人。
+**Other languages:** [繁體中文](README.zh-Hant.md) · [台語](README.nan-Hant-TW.md)
 
-**Full debug story:** [Touch ID 偷換輸入法：一次完整的 macOS 系統除錯紀錄](https://lzong.tw/zh-Hant/posts/touch-id-swaps-input-source) · [English](https://lzong.tw/en/posts/touch-id-swaps-input-source) · [台語](https://lzong.tw/nan-Hant-TW/posts/touch-id-swaps-input-source)
+**Full debug story:** [English](https://lzong.tw/en/posts/touch-id-swaps-input-source) · [繁體中文](https://lzong.tw/zh-Hant/posts/touch-id-swaps-input-source) · [台語](https://lzong.tw/nan-Hant-TW/posts/touch-id-swaps-input-source)
 
 ## What triggers the bug
 
