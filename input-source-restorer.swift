@@ -70,7 +70,7 @@ DistributedNotificationCenter.default().addObserver(
 }
 
 // Poll Secure Input state
-Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
     let isSecure = IsSecureEventInputEnabled()
 
     if isSecure && !secureInputWasActive {
@@ -85,10 +85,8 @@ Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
         log("secure input OFF [\(app)], current: \(currentID), target: \(savedBeforeSecure ?? "nil")")
 
         guard let target = savedBeforeSecure, currentID == ABC, target != currentID else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            selectSource(id: target)
-            log("restored \(target)")
-        }
+        selectSource(id: target)
+        log("restored \(target)")
     }
 }
 
@@ -97,7 +95,7 @@ FileManager.default.createFile(atPath: logPath, contents: nil)
 if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
 }
-log("started v4 (track non-ABC only), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
+log("started v5 (100ms poll, immediate restore), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()
