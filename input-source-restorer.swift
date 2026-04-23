@@ -69,8 +69,12 @@ DistributedNotificationCenter.default().addObserver(
     }
 }
 
-// Poll Secure Input state
-Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+// Poll Secure Input state — DispatchSourceTimer with leeway lets the OS
+// coalesce our wake-up with other background timers, saving battery on
+// Apple Silicon efficiency cores.
+let pollTimer = DispatchSource.makeTimerSource(queue: .main)
+pollTimer.schedule(deadline: .now() + 0.1, repeating: .milliseconds(100), leeway: .milliseconds(50))
+pollTimer.setEventHandler {
     let isSecure = IsSecureEventInputEnabled()
 
     if isSecure && !secureInputWasActive {
@@ -89,13 +93,14 @@ Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
         log("restored \(target)")
     }
 }
+pollTimer.resume()
 
 // Init
 FileManager.default.createFile(atPath: logPath, contents: nil)
 if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
 }
-log("started v5 (100ms poll, immediate restore), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
+log("started v6 (100ms poll w/ 50ms leeway), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()
