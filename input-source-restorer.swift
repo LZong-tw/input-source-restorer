@@ -12,15 +12,21 @@ var lastNonAbcSourceID: String? = nil
 var secureInputWasActive = false
 var savedBeforeSecure: String? = nil
 var myOwnChange = false
+var lastSwitchTime: Date = Date()
+var lastSwitchSourceID: String? = nil
 
 let ABC = "com.apple.keylayout.ABC"
 
 let logPath = NSHomeDirectory() + "/.local/log/input-source-restorer.log"
 
-func log(_ msg: String) {
+let isoFormatter: DateFormatter = {
     let df = DateFormatter()
-    df.dateFormat = "yyyy-MM-dd HH:mm:ss"
-    let line = "\(df.string(from: Date())) \(msg)\n"
+    df.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+    return df
+}()
+
+func log(_ msg: String) {
+    let line = "\(isoFormatter.string(from: Date())) \(msg)\n"
     if let fh = FileHandle(forWritingAtPath: logPath) {
         fh.seekToEndOfFile()
         fh.write(line.data(using: .utf8)!)
@@ -28,10 +34,41 @@ func log(_ msg: String) {
     }
 }
 
+// Top 5 non-system processes by CPU — useful clue for "mystery" switches.
+// Runs `ps -arcwwxo pid,%cpu,comm -r | head -6 | tail -5` async.
+func snapshotActiveProcesses(completion: @escaping (String) -> Void) {
+    DispatchQueue.global(qos: .background).async {
+        let pipe = Pipe()
+        let task = Process()
+        task.launchPath = "/bin/sh"
+        task.arguments = ["-c", "ps -arcwwxo pid,%cpu,comm -r 2>/dev/null | head -6 | tail -5 | awk '{printf \"%s(%s%%) \", $3, $2}'"]
+        task.standardOutput = pipe
+        task.standardError = Pipe()
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            DispatchQueue.main.async { completion(str) }
+        } catch {
+            DispatchQueue.main.async { completion("err") }
+        }
+    }
+}
+
 func currentSourceID() -> String? {
     guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return nil }
     guard let ptr = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) else { return nil }
     return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
+}
+
+func contextSnapshot(_ event: String, prevSource: String? = nil) -> String {
+    let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+    let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
+    let secure = IsSecureEventInputEnabled() ? "1" : "0"
+    let dt = String(format: "%.2f", Date().timeIntervalSince(lastSwitchTime))
+    let prev = prevSource.map { ", prev=\($0)" } ?? ""
+    return "[\(app)|\(bundleID)] secure=\(secure) Δt=\(dt)s\(prev) | \(event)"
 }
 
 @discardableResult
@@ -47,13 +84,13 @@ func selectSource(id: String) -> Bool {
             myOwnChange = true
             let status = TISSelectInputSource(src)
             if status != noErr {
-                log("WARN: TISSelectInputSource returned \(status)")
+                log("WARN TISSelectInputSource status=\(status) for \(id)")
                 myOwnChange = false
             }
             return status == noErr
         }
     }
-    log("WARN: source not found in list: \(id)")
+    log("WARN source not found in enabled list: \(id)")
     return false
 }
 
@@ -61,58 +98,80 @@ func restoreSource(_ target: String, attempt: Int = 1) {
     guard currentSourceID() == ABC else { return }
     let ok = selectSource(id: target)
     if ok {
-        log("restored \(target) (attempt \(attempt))")
+        log("RESTORED \(target) attempt=\(attempt)")
     } else if attempt < 3 {
-        // Retry with backoff — TIS can be briefly unavailable during session transitions
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(attempt * 150)) {
             restoreSource(target, attempt: attempt + 1)
         }
     } else {
-        log("ERROR: failed to restore \(target) after \(attempt) attempts")
+        log("ERROR failed to restore \(target) after \(attempt) attempts")
     }
 }
 
 var mysterySwitchGeneration = 0
 
-// Track input source changes — only remember non-ABC sources, and detect
-// "mystery" switches to ABC that don't go through Secure Input (e.g., iTerm2
-// Secure Keyboard Entry brief pulse, per-app switching, third-party API calls).
+// Track input source changes
 DistributedNotificationCenter.default().addObserver(
     forName: .init("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
     object: nil,
     queue: .main
 ) { _ in
     guard let newID = currentSourceID() else { return }
-    if myOwnChange { myOwnChange = false; return }
+    let prev = lastSwitchSourceID
+
+    if myOwnChange {
+        myOwnChange = false
+        log("TIS_OWN " + contextSnapshot("→ \(newID)", prevSource: prev))
+        lastSwitchTime = Date()
+        lastSwitchSourceID = newID
+        return
+    }
+
+    log("TIS " + contextSnapshot("→ \(newID)", prevSource: prev))
+    lastSwitchTime = Date()
+    lastSwitchSourceID = newID
 
     if newID != ABC {
         lastNonAbcSourceID = newID
         return
     }
 
-    // newID == ABC and we didn't do it. If Secure Input is already active,
-    // the polling timer's ON/OFF path will handle it. Otherwise schedule a
-    // delayed check — 1.5s gives the user time to type something in ABC if
-    // they switched intentionally, and gives Secure Input time to activate
-    // if it's a delayed system trigger.
+    // newID == ABC and we didn't do it. Mystery switch path.
     guard !secureInputWasActive else { return }
     mysterySwitchGeneration += 1
     let gen = mysterySwitchGeneration
-    let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-    log("mystery switch to ABC [\(app)] (no Secure Input), checking in 1.5s")
+
+    snapshotActiveProcesses { processes in
+        log("MYSTERY_DETECTED procs=[\(processes)]")
+    }
+
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-        guard gen == mysterySwitchGeneration else { return }  // a newer event superseded
-        guard currentSourceID() == ABC else { return }        // user already switched back
-        guard !IsSecureEventInputEnabled() else { return }    // normal Secure Input path will handle it
-        guard !secureInputWasActive else { return }
-        guard let target = lastNonAbcSourceID, target != ABC else { return }
-        log("mystery switch confirmed, restoring \(target)")
+        guard gen == mysterySwitchGeneration else {
+            log("MYSTERY_SUPERSEDED gen=\(gen)")
+            return
+        }
+        guard currentSourceID() == ABC else {
+            log("MYSTERY_DISMISSED reason=user_reverted current=\(currentSourceID() ?? "nil")")
+            return
+        }
+        guard !IsSecureEventInputEnabled() else {
+            log("MYSTERY_DISMISSED reason=secure_input_now_active")
+            return
+        }
+        guard !secureInputWasActive else {
+            log("MYSTERY_DISMISSED reason=secure_input_path_handling")
+            return
+        }
+        guard let target = lastNonAbcSourceID, target != ABC else {
+            log("MYSTERY_DISMISSED reason=no_target")
+            return
+        }
+        log("MYSTERY_CONFIRMED " + contextSnapshot("restoring \(target)"))
         restoreSource(target)
     }
 }
 
-// Poll Secure Input state — DispatchSourceTimer with leeway lets the OS
-// coalesce our wake-up with other background timers, saving battery.
+// Poll Secure Input state
 let pollTimer = DispatchSource.makeTimerSource(queue: .main)
 pollTimer.schedule(deadline: .now() + 0.1, repeating: .milliseconds(100), leeway: .milliseconds(50))
 pollTimer.setEventHandler {
@@ -121,13 +180,13 @@ pollTimer.setEventHandler {
     if isSecure && !secureInputWasActive {
         secureInputWasActive = true
         savedBeforeSecure = lastNonAbcSourceID
-        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-        log("secure input ON [\(app)], target: \(savedBeforeSecure ?? "nil")")
+        snapshotActiveProcesses { processes in
+            log("SECURE_ON " + contextSnapshot("target=\(savedBeforeSecure ?? "nil") procs=[\(processes)]"))
+        }
     } else if !isSecure && secureInputWasActive {
         secureInputWasActive = false
-        let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
         let currentID = currentSourceID() ?? "nil"
-        log("secure input OFF [\(app)], current: \(currentID), target: \(savedBeforeSecure ?? "nil")")
+        log("SECURE_OFF " + contextSnapshot("current=\(currentID) target=\(savedBeforeSecure ?? "nil")"))
 
         guard let target = savedBeforeSecure, currentID == ABC, target != currentID else { return }
         restoreSource(target)
@@ -135,12 +194,29 @@ pollTimer.setEventHandler {
 }
 pollTimer.resume()
 
+// Track app activations for context (helpful when correlating mystery switches with app focus changes)
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didActivateApplicationNotification,
+    object: nil,
+    queue: .main
+) { notification in
+    guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+    let name = app.localizedName ?? "unknown"
+    let bundleID = app.bundleIdentifier ?? "unknown"
+    // Only log app activations that happen close to a TIS event (within 2s)
+    let dt = Date().timeIntervalSince(lastSwitchTime)
+    if dt < 2.0 {
+        log("APP_FOCUS [\(name)|\(bundleID)] Δt=\(String(format: "%.2f", dt))s_after_TIS")
+    }
+}
+
 // Init
 FileManager.default.createFile(atPath: logPath, contents: nil)
 if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
+    lastSwitchSourceID = initial
 }
-log("started v8 (mystery switch fallback), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
+log("STARTED v9 (rich logging) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()
