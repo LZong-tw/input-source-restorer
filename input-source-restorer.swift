@@ -72,7 +72,11 @@ func restoreSource(_ target: String, attempt: Int = 1) {
     }
 }
 
-// Track input source changes — only remember non-ABC sources
+var mysterySwitchGeneration = 0
+
+// Track input source changes — only remember non-ABC sources, and detect
+// "mystery" switches to ABC that don't go through Secure Input (e.g., iTerm2
+// Secure Keyboard Entry brief pulse, per-app switching, third-party API calls).
 DistributedNotificationCenter.default().addObserver(
     forName: .init("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
     object: nil,
@@ -80,7 +84,31 @@ DistributedNotificationCenter.default().addObserver(
 ) { _ in
     guard let newID = currentSourceID() else { return }
     if myOwnChange { myOwnChange = false; return }
-    if newID != ABC { lastNonAbcSourceID = newID }
+
+    if newID != ABC {
+        lastNonAbcSourceID = newID
+        return
+    }
+
+    // newID == ABC and we didn't do it. If Secure Input is already active,
+    // the polling timer's ON/OFF path will handle it. Otherwise schedule a
+    // delayed check — 1.5s gives the user time to type something in ABC if
+    // they switched intentionally, and gives Secure Input time to activate
+    // if it's a delayed system trigger.
+    guard !secureInputWasActive else { return }
+    mysterySwitchGeneration += 1
+    let gen = mysterySwitchGeneration
+    let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+    log("mystery switch to ABC [\(app)] (no Secure Input), checking in 1.5s")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        guard gen == mysterySwitchGeneration else { return }  // a newer event superseded
+        guard currentSourceID() == ABC else { return }        // user already switched back
+        guard !IsSecureEventInputEnabled() else { return }    // normal Secure Input path will handle it
+        guard !secureInputWasActive else { return }
+        guard let target = lastNonAbcSourceID, target != ABC else { return }
+        log("mystery switch confirmed, restoring \(target)")
+        restoreSource(target)
+    }
 }
 
 // Poll Secure Input state — DispatchSourceTimer with leeway lets the OS
@@ -112,7 +140,7 @@ FileManager.default.createFile(atPath: logPath, contents: nil)
 if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
 }
-log("started v7 (retry+status), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
+log("started v8 (mystery switch fallback), initial source: \(currentSourceID() ?? "nil"), tracked: \(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()
