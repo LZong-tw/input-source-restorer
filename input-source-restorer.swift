@@ -109,6 +109,9 @@ func restoreSource(_ target: String, attempt: Int = 1) {
 }
 
 var mysterySwitchGeneration = 0
+var lastRestoreAttempt: Date = .distantPast
+var consecutiveRestores = 0
+var backoffUntil: Date = .distantPast
 
 // Track input source changes
 DistributedNotificationCenter.default().addObserver(
@@ -136,38 +139,12 @@ DistributedNotificationCenter.default().addObserver(
         return
     }
 
-    // newID == ABC and we didn't do it. Mystery switch path.
-    guard !secureInputWasActive else { return }
-    mysterySwitchGeneration += 1
-    let gen = mysterySwitchGeneration
-
-    snapshotActiveProcesses { processes in
-        log("MYSTERY_DETECTED procs=[\(processes)]")
-    }
-
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-        guard gen == mysterySwitchGeneration else {
-            log("MYSTERY_SUPERSEDED gen=\(gen)")
-            return
+    // Switched to ABC and we didn't do it. The enforce timer (500ms tick)
+    // will catch this within a tick. We just log here so we have forensics.
+    if !secureInputWasActive && !IsSecureEventInputEnabled() {
+        snapshotActiveProcesses { processes in
+            log("MYSTERY_DETECTED procs=[\(processes)]")
         }
-        guard currentSourceID() == ABC else {
-            log("MYSTERY_DISMISSED reason=user_reverted current=\(currentSourceID() ?? "nil")")
-            return
-        }
-        guard !IsSecureEventInputEnabled() else {
-            log("MYSTERY_DISMISSED reason=secure_input_now_active")
-            return
-        }
-        guard !secureInputWasActive else {
-            log("MYSTERY_DISMISSED reason=secure_input_path_handling")
-            return
-        }
-        guard let target = lastNonAbcSourceID, target != ABC else {
-            log("MYSTERY_DISMISSED reason=no_target")
-            return
-        }
-        log("MYSTERY_CONFIRMED " + contextSnapshot("restoring \(target)"))
-        restoreSource(target)
     }
 }
 
@@ -194,6 +171,56 @@ pollTimer.setEventHandler {
 }
 pollTimer.resume()
 
+// Enforce loop — replaces the 1.5s mystery deferred check with a continuous
+// guarantee. If source is ABC and Secure Input is NOT active, restore.
+// Has rate limiting and adaptive backoff to avoid restore-wars with offending apps.
+let enforceTimer = DispatchSource.makeTimerSource(queue: .main)
+enforceTimer.schedule(deadline: .now() + 0.3, repeating: .milliseconds(300), leeway: .milliseconds(100))
+enforceTimer.setEventHandler {
+    // Skip if Secure Input is active — let macOS's auth dialog use ABC
+    guard !IsSecureEventInputEnabled() && !secureInputWasActive else { return }
+
+    // Skip if we're in adaptive backoff (an offender keeps undoing our restore)
+    let now = Date()
+    guard now >= backoffUntil else { return }
+
+    // Skip if source is already non-ABC
+    guard currentSourceID() == ABC else {
+        consecutiveRestores = 0
+        return
+    }
+
+    // Need a target
+    guard let target = lastNonAbcSourceID, target != ABC else { return }
+
+    // Rate limit: don't restore more than once per 250ms
+    if now.timeIntervalSince(lastRestoreAttempt) < 0.25 { return }
+
+    // Adaptive backoff: if 5+ consecutive restores in this run, back off 5s
+    if consecutiveRestores >= 5 {
+        backoffUntil = now.addingTimeInterval(5)
+        log("BACKOFF \(consecutiveRestores) consecutive restores, pausing 5s")
+        consecutiveRestores = 0
+        return
+    }
+
+    lastRestoreAttempt = now
+    consecutiveRestores += 1
+    log("ENFORCE " + contextSnapshot("restoring \(target) (consec=\(consecutiveRestores))"))
+    restoreSource(target)
+}
+enforceTimer.resume()
+
+// Reset consecutive counter when we see a stable non-ABC state for a while
+let resetTimer = DispatchSource.makeTimerSource(queue: .main)
+resetTimer.schedule(deadline: .now() + 3, repeating: .seconds(3))
+resetTimer.setEventHandler {
+    if currentSourceID() != ABC && consecutiveRestores > 0 {
+        consecutiveRestores = 0
+    }
+}
+resetTimer.resume()
+
 // Track app activations for context (helpful when correlating mystery switches with app focus changes)
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
@@ -216,7 +243,7 @@ if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
     lastSwitchSourceID = initial
 }
-log("STARTED v9 (rich logging) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
+log("STARTED v10 (enforce loop) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()
