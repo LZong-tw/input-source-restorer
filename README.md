@@ -21,12 +21,14 @@ Any macOS Secure Input activation. Confirmed triggers:
 
 ## How it works
 
-- Polls `IsSecureEventInputEnabled()` (Carbon API) every 0.25s
+- Polls `IsSecureEventInputEnabled()` (Carbon API) every 100ms
 - When Secure Input activates → saves the last non-ABC input source
 - When Secure Input deactivates → restores it via `TISSelectInputSource`
+- Runs a 300ms enforce loop for non-Secure-Input ABC switches
+- Tracks the app/window that activated Secure Input. If Secure Input remains globally active but the frontmost app/window has moved away from the owner, it restores the previous input source instead of letting a background password field poison normal typing.
 - **Only tracks non-ABC sources** — TIS switches to ABC *before* Secure Input activates, so naively saving "current source at activation" gets ABC. This implementation avoids that contamination.
 
-No accessibility permission required. No keyboard event tap. ~100 lines of Swift.
+No accessibility permission required. No keyboard event tap. One small Swift daemon.
 
 ## Install
 

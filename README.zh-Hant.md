@@ -21,12 +21,14 @@
 
 ## 原理
 
-- 每 0.25 秒輪詢 `IsSecureEventInputEnabled()`（Carbon API）
+- 每 100ms 輪詢 `IsSecureEventInputEnabled()`（Carbon API）
 - Secure Input 啟動時 → 記住最後一次**非 ABC** 的輸入法
 - Secure Input 結束時 → 透過 `TISSelectInputSource` 還原
+- 每 300ms 跑一次 enforce loop，處理沒有走 Secure Input 的 ABC 切換
+- 記錄啟動 Secure Input 的 app / window。如果 Secure Input 仍然是全域 active，但最前景 app / window 已經離開原本的 owner，就還原輸入法，避免背景密碼框污染一般打字。
 - **只追蹤非 ABC 的輸入法** — TIS 切換到 ABC 發生在 Secure Input 啟動之前，直接記錄「啟動當下的輸入法」會剛好拿到 ABC。這個實作避開這個污染問題。
 
-不需要輔助功能權限、不用鍵盤事件攔截。Swift 約 100 行。
+不需要輔助功能權限、不用鍵盤事件攔截。一個小型 Swift daemon。
 
 ## 安裝
 

@@ -11,11 +11,17 @@ import Carbon
 var lastNonAbcSourceID: String? = nil
 var secureInputWasActive = false
 var savedBeforeSecure: String? = nil
+var secureInputOwner: AppContext? = nil
 var myOwnChange = false
 var lastSwitchTime: Date = Date()
 var lastSwitchSourceID: String? = nil
 
 let ABC = "com.apple.keylayout.ABC"
+let systemAuthBundleIDs: Set<String> = [
+    "com.apple.loginwindow",
+    "com.apple.SecurityAgent",
+    "com.apple.CoreAuthentication.agent",
+]
 
 let logPath = NSHomeDirectory() + "/.local/log/input-source-restorer.log"
 
@@ -62,13 +68,55 @@ func currentSourceID() -> String? {
     return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
 }
 
+struct AppContext: Equatable {
+    let name: String
+    let bundleID: String
+    let pid: pid_t
+    let windowTitle: String
+
+    var isSystemAuth: Bool {
+        systemAuthBundleIDs.contains(bundleID)
+    }
+
+    var short: String {
+        let title = windowTitle.isEmpty ? "-" : windowTitle
+        return "\(name)|\(bundleID)|pid=\(pid)|win=\(title)"
+    }
+}
+
+func frontWindowTitle(pid: pid_t) -> String {
+    guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+        return ""
+    }
+
+    for window in info {
+        guard let ownerPID = window[kCGWindowOwnerPID as String] as? pid_t, ownerPID == pid else { continue }
+        guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0 else { continue }
+        return window[kCGWindowName as String] as? String ?? ""
+    }
+
+    return ""
+}
+
+func currentAppContext() -> AppContext {
+    guard let app = NSWorkspace.shared.frontmostApplication else {
+        return AppContext(name: "unknown", bundleID: "unknown", pid: -1, windowTitle: "")
+    }
+
+    return AppContext(
+        name: app.localizedName ?? "unknown",
+        bundleID: app.bundleIdentifier ?? "unknown",
+        pid: app.processIdentifier,
+        windowTitle: frontWindowTitle(pid: app.processIdentifier)
+    )
+}
+
 func contextSnapshot(_ event: String, prevSource: String? = nil) -> String {
-    let app = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-    let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
+    let app = currentAppContext()
     let secure = IsSecureEventInputEnabled() ? "1" : "0"
     let dt = String(format: "%.2f", Date().timeIntervalSince(lastSwitchTime))
     let prev = prevSource.map { ", prev=\($0)" } ?? ""
-    return "[\(app)|\(bundleID)] secure=\(secure) Δt=\(dt)s\(prev) | \(event)"
+    return "[\(app.short)] secure=\(secure) Δt=\(dt)s\(prev) | \(event)"
 }
 
 @discardableResult
@@ -156,17 +204,21 @@ pollTimer.setEventHandler {
 
     if isSecure && !secureInputWasActive {
         secureInputWasActive = true
+        secureInputOwner = currentAppContext()
         savedBeforeSecure = lastNonAbcSourceID
         snapshotActiveProcesses { processes in
-            log("SECURE_ON " + contextSnapshot("target=\(savedBeforeSecure ?? "nil") procs=[\(processes)]"))
+            log("SECURE_ON " + contextSnapshot("target=\(savedBeforeSecure ?? "nil") owner=[\(secureInputOwner?.short ?? "nil")] procs=[\(processes)]"))
         }
     } else if !isSecure && secureInputWasActive {
         secureInputWasActive = false
         let currentID = currentSourceID() ?? "nil"
-        log("SECURE_OFF " + contextSnapshot("current=\(currentID) target=\(savedBeforeSecure ?? "nil")"))
+        let owner = secureInputOwner?.short ?? "nil"
+        log("SECURE_OFF " + contextSnapshot("current=\(currentID) target=\(savedBeforeSecure ?? "nil") owner=[\(owner)]"))
 
-        guard let target = savedBeforeSecure, currentID == ABC, target != currentID else { return }
-        restoreSource(target)
+        if let target = savedBeforeSecure, currentID == ABC, target != currentID {
+            restoreSource(target)
+        }
+        secureInputOwner = nil
     }
 }
 pollTimer.resume()
@@ -177,8 +229,17 @@ pollTimer.resume()
 let enforceTimer = DispatchSource.makeTimerSource(queue: .main)
 enforceTimer.schedule(deadline: .now() + 0.3, repeating: .milliseconds(300), leeway: .milliseconds(100))
 enforceTimer.setEventHandler {
-    // Skip if Secure Input is active — let macOS's auth dialog use ABC
-    guard !IsSecureEventInputEnabled() && !secureInputWasActive else { return }
+    // Secure Input is global. If the frontmost app/window is still the owner,
+    // stay conservative and let the password field use ABC. If focus has moved
+    // away from the owner, restore so a background secure field cannot poison
+    // normal typing in another window.
+    let isSecure = IsSecureEventInputEnabled()
+    let app = currentAppContext()
+    if isSecure || secureInputWasActive {
+        guard let owner = secureInputOwner else { return }
+        guard !owner.isSystemAuth else { return }
+        guard app != owner else { return }
+    }
 
     // Skip if we're in adaptive backoff (an offender keeps undoing our restore)
     let now = Date()
@@ -206,7 +267,8 @@ enforceTimer.setEventHandler {
 
     lastRestoreAttempt = now
     consecutiveRestores += 1
-    log("ENFORCE " + contextSnapshot("restoring \(target) (consec=\(consecutiveRestores))"))
+    let owner = secureInputOwner.map { " owner=[\($0.short)]" } ?? ""
+    log("ENFORCE " + contextSnapshot("restoring \(target) (consec=\(consecutiveRestores))\(owner)"))
     restoreSource(target)
 }
 enforceTimer.resume()
@@ -228,13 +290,14 @@ NSWorkspace.shared.notificationCenter.addObserver(
     queue: .main
 ) { notification in
     guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-    let name = app.localizedName ?? "unknown"
-    let bundleID = app.bundleIdentifier ?? "unknown"
-    // Only log app activations that happen close to a TIS event (within 2s)
+    let context = AppContext(
+        name: app.localizedName ?? "unknown",
+        bundleID: app.bundleIdentifier ?? "unknown",
+        pid: app.processIdentifier,
+        windowTitle: frontWindowTitle(pid: app.processIdentifier)
+    )
     let dt = Date().timeIntervalSince(lastSwitchTime)
-    if dt < 2.0 {
-        log("APP_FOCUS [\(name)|\(bundleID)] Δt=\(String(format: "%.2f", dt))s_after_TIS")
-    }
+    log("APP_FOCUS [\(context.short)] Δt=\(String(format: "%.2f", dt))s_after_TIS")
 }
 
 // Init
@@ -243,7 +306,7 @@ if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
     lastSwitchSourceID = initial
 }
-log("STARTED v10 (enforce loop) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
+log("STARTED v11 (secure owner context policy) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()
