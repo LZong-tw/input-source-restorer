@@ -23,9 +23,10 @@ Any macOS Secure Input activation. Confirmed triggers:
 
 - Polls `IsSecureEventInputEnabled()` (Carbon API) every 100ms
 - When Secure Input activates → saves the last non-ABC input source
-- When Secure Input deactivates → restores it via `TISSelectInputSource`
+- When Secure Input deactivates → restores it via `TISSelectInputSource`, then verifies the result shortly after in case macOS overwrote the restore
 - Runs a 300ms enforce loop for non-Secure-Input ABC switches
 - Tracks the app/window that activated Secure Input. If Secure Input remains globally active but the frontmost app/window has moved away from the owner, it restores the previous input source instead of letting a background password field poison normal typing.
+- Does not fight `loginwindow` / `SecurityAgent` while a system authentication prompt owns the foreground. It waits for Secure Input to turn off, then restores.
 - **Only tracks non-ABC sources** — TIS switches to ABC *before* Secure Input activates, so naively saving "current source at activation" gets ABC. This implementation avoids that contamination.
 
 No accessibility permission required. No keyboard event tap. One small Swift daemon.
@@ -54,7 +55,7 @@ Open any password prompt (e.g. `sudo -v` in Terminal with `pam_tid.so`), then ch
 tail -f ~/.local/log/input-source-restorer.log
 ```
 
-You should see `secure input ON` → `secure input OFF` → `restored <your-ime-id>`.
+You should see `SECURE_ON` → `SECURE_OFF` → `RESTORED <your-ime-id> reason=secure_off`.
 
 ## Uninstall
 

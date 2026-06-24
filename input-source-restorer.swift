@@ -142,17 +142,42 @@ func selectSource(id: String) -> Bool {
     return false
 }
 
-func restoreSource(_ target: String, attempt: Int = 1) {
-    guard currentSourceID() == ABC else { return }
+@discardableResult
+func restoreSource(_ target: String, attempt: Int = 1, reason: String) -> Bool {
+    guard let current = currentSourceID() else {
+        log("RESTORE_SKIP reason=\(reason) current=nil target=\(target)")
+        return false
+    }
+    guard current == ABC else {
+        log("RESTORE_SKIP reason=\(reason) current=\(current) target=\(target)")
+        return false
+    }
+
     let ok = selectSource(id: target)
     if ok {
-        log("RESTORED \(target) attempt=\(attempt)")
+        log("RESTORED \(target) reason=\(reason) attempt=\(attempt)")
+        return true
     } else if attempt < 3 {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(attempt * 150)) {
-            restoreSource(target, attempt: attempt + 1)
+            restoreSource(target, attempt: attempt + 1, reason: reason)
         }
     } else {
-        log("ERROR failed to restore \(target) after \(attempt) attempts")
+        log("ERROR failed to restore \(target) reason=\(reason) after \(attempt) attempts")
+    }
+
+    return false
+}
+
+func verifyRestoreAfterSecureOff(target: String, delayMs: Int) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) {
+        let current = currentSourceID() ?? "nil"
+        guard current == ABC else {
+            log("VERIFY_OK reason=secure_off+\(delayMs)ms current=\(current) target=\(target)")
+            return
+        }
+
+        log("VERIFY_RESTORE reason=secure_off+\(delayMs)ms current=\(current) target=\(target)")
+        restoreSource(target, reason: "secure_off_verify_\(delayMs)ms")
     }
 }
 
@@ -216,7 +241,11 @@ pollTimer.setEventHandler {
         log("SECURE_OFF " + contextSnapshot("current=\(currentID) target=\(savedBeforeSecure ?? "nil") owner=[\(owner)]"))
 
         if let target = savedBeforeSecure, currentID == ABC, target != currentID {
-            restoreSource(target)
+            consecutiveRestores = 0
+            backoffUntil = .distantPast
+            restoreSource(target, reason: "secure_off")
+            verifyRestoreAfterSecureOff(target: target, delayMs: 250)
+            verifyRestoreAfterSecureOff(target: target, delayMs: 750)
         }
         secureInputOwner = nil
     }
@@ -235,6 +264,10 @@ enforceTimer.setEventHandler {
     // normal typing in another window.
     let isSecure = IsSecureEventInputEnabled()
     let app = currentAppContext()
+    if app.isSystemAuth {
+        consecutiveRestores = 0
+        return
+    }
     if isSecure || secureInputWasActive {
         guard let owner = secureInputOwner else { return }
         guard !owner.isSystemAuth else { return }
@@ -269,7 +302,7 @@ enforceTimer.setEventHandler {
     consecutiveRestores += 1
     let owner = secureInputOwner.map { " owner=[\($0.short)]" } ?? ""
     log("ENFORCE " + contextSnapshot("restoring \(target) (consec=\(consecutiveRestores))\(owner)"))
-    restoreSource(target)
+    restoreSource(target, reason: "enforce")
 }
 enforceTimer.resume()
 
@@ -306,7 +339,7 @@ if let initial = currentSourceID(), initial != ABC {
     lastNonAbcSourceID = initial
     lastSwitchSourceID = initial
 }
-log("STARTED v11 (secure owner context policy) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
+log("STARTED v12 (system auth guard + secure-off verify) initial=\(currentSourceID() ?? "nil") tracked=\(lastNonAbcSourceID ?? "nil")")
 
 NSApplication.shared.setActivationPolicy(.accessory)
 CFRunLoopRun()

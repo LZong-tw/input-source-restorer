@@ -23,9 +23,10 @@
 
 - 每 100ms 輪詢 `IsSecureEventInputEnabled()`（Carbon API）
 - Secure Input 啟動ê時 → 記上尾一擺**非 ABC** ê輸入法
-- Secure Input 結束ê時 → 透過 `TISSelectInputSource` 還原
+- Secure Input 結束ê時 → 透過 `TISSelectInputSource` 還原，閣短短仔等一下後確認一擺，避免 macOS 閣覆寫做 ABC
 - 每 300ms 跑一擺 enforce loop，處理無經過 Secure Input ê ABC 切換
 - 記錄啟動 Secure Input ê app / window。若 Secure Input 猶原是全域 active，毋過上前景ê app / window 已經離開原本ê owner，就還原輸入法，避免背景暗號框污染一般拍字。
+- `loginwindow` / `SecurityAgent` 這款系統驗證視窗佇上前景ê時，毋佮 macOS 搶輸入法；等 Secure Input 結束了後才還原。
 - **只追蹤非 ABC ê輸入法** — TIS 切換到 ABC 發生佇 Secure Input 啟動ê前，若直接記錄「啟動當下ê輸入法」會拄拄仔抓著 ABC。這个實作閃開這个污染問題。
 
 毋免輔助功能權限、嘛毋免鍵盤事件攔截。一个細漢ê Swift daemon。
@@ -54,7 +55,7 @@ cd input-source-restorer
 tail -f ~/.local/log/input-source-restorer.log
 ```
 
-應該會看著 `secure input ON` → `secure input OFF` → `restored <你ê輸入法 ID>`。
+應該會看著 `SECURE_ON` → `SECURE_OFF` → `RESTORED <你ê輸入法 ID> reason=secure_off`。
 
 ## 解除安裝
 
